@@ -7,6 +7,9 @@ import typing
 from scipy.stats import binom
 from scipy import special as scisp
 
+import matplotlib.pyplot as plt
+from sklearn.mixture import GaussianMixture
+
 from . import utils
 from . import dist
 
@@ -116,8 +119,136 @@ def _m_step(zeroth_order,
     return coefs, means, variance
 
 
-def init_pars():
-    raise NotImplementedError
+def _find_k_from_bins(alt_allele_counts, n_counts):
+    ratios = [a / n for a, n in zip(alt_allele_counts, n_counts)]
+    ratios.sort()
+    bin_counts = [0] * 10
+    for r in ratios:
+        idx = 9 if r == 1.0 else int(r * 10)
+        bin_counts[idx] += 1
+    peak_indices = []
+    for i in range(1, 9):
+        if bin_counts[i] > bin_counts[i - 1] and bin_counts[i] > bin_counts[i + 1]:
+            peak_indices.append(i)
+    if not peak_indices:
+        if bin_counts[0] > bin_counts[1]:
+            peak_indices.append(0)
+        if bin_counts[9] > bin_counts[8]:
+            peak_indices.append(9)
+    if not peak_indices:
+        peak_indices = [bin_counts.index(max(bin_counts))]
+    return len(peak_indices)
+
+def _find_k_gmm(d_reshaped, criterion="AIC"):
+    best_k = None
+    best_score = np.inf
+    for candidate_k in range(1, 5):
+        gmm = GaussianMixture(n_components=candidate_k, covariance_type="full", random_state=42)
+        gmm.fit(d_reshaped)
+        score = gmm.aic(d_reshaped) if criterion.upper() == "AIC" else gmm.bic(d_reshaped)
+        if score < best_score:
+            best_score = score
+            best_k = candidate_k
+    return best_k
+
+def _plot_clusters(log_ref_clean, log_alt_clean, labels, sorted_centers):
+    plt.figure(figsize=(8, 6))
+    plt.scatter(log_ref_clean, log_alt_clean, c=labels, cmap='viridis', alpha=0.5)
+    plt.xlabel("log(ref)")
+    plt.ylabel("log(alt)")
+    plt.title("Scatter Plot of log(ref) vs. log(alt) with Parallel Lines")
+    x_vals = np.linspace(log_ref_clean.min(), log_ref_clean.max(), 200)
+    for c in sorted_centers:
+        y_vals = x_vals + c
+        plt.plot(x_vals, y_vals, '--', label=f'y = x + {c:.2f}')
+    plt.legend()
+    plt.show()
+
+def init_pars(
+    alt_allele_counts=None,
+    n_counts=None,
+    k=None,
+    method=None,
+    do_plot=False
+):
+    if method == "partition":
+        if k is None:
+            raise ValueError("When using method='partition', the number of components k must be specified.")
+        coefs = [1.0 / k] * k
+        means = [math.log(p / (1 - p)) for p in [(i + 1) / (k + 1) for i in range(k)]]
+        return {
+            "k": k,
+            "means": means,
+            "coefs": coefs,
+            "variance": 1.0
+        }
+
+    if alt_allele_counts is None or n_counts is None:
+        raise ValueError("alt_allele_counts and n_counts must be provided.")
+
+    alt_allele_counts = np.asarray(alt_allele_counts, dtype=float)
+    n_counts = np.asarray(n_counts, dtype=float)
+
+    if len(alt_allele_counts) != len(n_counts):
+        raise ValueError("alt_allele_counts and n_counts must have the same length.")
+    if len(alt_allele_counts) == 0:
+        raise ValueError("Input arrays must not be empty.")
+
+    for a, n in zip(alt_allele_counts, n_counts):
+        if a < 0 or n <= 0:
+            raise ValueError("All alt_allele_counts must be >= 0 and all n_counts > 0.")
+        if a > n:
+            raise ValueError("Each alt_allele_count must be <= the corresponding n_count.")
+
+    ref = (n_counts - alt_allele_counts).astype(float)
+    alt = alt_allele_counts.astype(float)
+    log_ref = np.log(ref)
+    log_alt = np.log(alt)
+
+    mask = np.isfinite(log_ref) & np.isfinite(log_alt)
+    log_ref_clean = log_ref[mask]
+    log_alt_clean = log_alt[mask]
+
+    if len(log_ref_clean) == 0:
+        raise ValueError("No valid (finite) data points remain after log transform.")
+
+    d = log_alt_clean - log_ref_clean
+    d_reshaped = d.reshape(-1, 1)
+
+    if k is None:
+        if method is None:
+            raise ValueError("If k is not specified, you must provide a method ('bins', 'AIC', or 'BIC').")
+        if method == "bins":
+            k = _find_k_from_bins(alt_allele_counts, n_counts)
+        elif method.upper() in ["AIC", "BIC"]:
+            k = _find_k_gmm(d_reshaped, criterion=method.upper())
+        else:
+            raise ValueError("method must be either 'bins', 'AIC', 'BIC', or 'partition'.")
+
+    gmm = GaussianMixture(n_components=k, covariance_type="full", random_state=42)
+    gmm.fit(d_reshaped)
+    labels = gmm.predict(d_reshaped)
+    centers = gmm.means_.flatten()
+    weights = gmm.weights_.flatten()
+
+    order = np.argsort(centers)
+    sorted_centers = centers[order]
+    sorted_weights = weights[order]
+    coefs = sorted_weights.tolist()
+
+    cluster_variances = np.array([gmm.covariances_[i][0][0] for i in range(k)])
+    sorted_var = cluster_variances[order]
+    overall_variance = float(np.sum((sorted_weights ** 2) * sorted_var))
+
+    if do_plot:
+        _plot_clusters(log_ref_clean, log_alt_clean, labels, sorted_centers)
+
+    return {
+        "k": k,
+        "means": sorted_centers.tolist(),
+        "coefs": coefs,
+        "variance": overall_variance
+    }
 
 
 def blnm(x_counts: npt.NDArray, 
